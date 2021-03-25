@@ -1,0 +1,20 @@
+[package]
+name = "gargoyle"
+version = "0.1.0"
+authors = ["Simon Rasmussen <zetlon@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+twsapi = "0.1.0"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version ="0.6.3", features = ["codec"] }
+async-stream = "0.3.0"
+bytes = "1.0.1"
+futures = "0.3.12"
+ascii = "1.0.0"
+chrono = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+bitflags = "1.2.1"
+rillrate = "0.23.1"
