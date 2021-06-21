@@ -4,18 +4,154 @@ use std::{
     io::ErrorKind,
 };
 
-use ascii::AsAsciiStr;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use tokio_util::codec;
+use tracing::{debug, error, info, instrument, trace, warn};
 
 const MAX: usize = 8 * 1024 * 1024;
+
+#[derive(Debug)]
+pub enum TWSFrame {
+    Incomming {
+        data: Bytes,
+        splits: Vec<std::ops::Range<usize>>,
+    },
+    Outgoing(Bytes),
+}
+
 pub type DecodedMessage = Vec<Bytes>;
+
+#[derive(Debug)]
 pub struct TWSCodec {}
 
 impl TWSCodec {
     pub fn new() -> TWSCodec {
         TWSCodec {}
     }
+}
+
+#[cfg(target_arch = "x86")]
+use std::arch::x86::*;
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
+
+#[inline(always)]
+fn round_up<const N: usize>(n: usize) -> usize {
+    (n + (N - 1)) / N * N
+}
+
+#[inline(always)]
+unsafe fn nonz_index(data: __m128i) -> __m128i {
+    let indx_const = 0xFEDCBA9876543210u64;
+    let pshufbcnst = _mm_set_epi8(
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0E, 0x0C, 0x0A, 0x08, 0x06, 0x04, 0x02,
+        0x00,
+    );
+    let mut null_mask = _mm_cmpeq_epi8(data, _mm_setzero_si128());
+    null_mask = _mm_srli_epi64(null_mask, 4);
+    null_mask = _mm_shuffle_epi8(null_mask, pshufbcnst);
+    let mask64 = !(_mm_cvtsi128_si64x(null_mask) as u64);
+
+    let indx64 = _pext_u64(indx_const, mask64) as i64;
+    let indx = _mm_cvtsi64x_si128(indx64);
+    let indx_024 = indx;
+    let indx_135 = _mm_srli_epi64(indx, 4);
+    let indx_res = _mm_unpacklo_epi8(indx_024, indx_135);
+
+    _mm_and_si128(indx_res, _mm_set1_epi8(0x0F))
+}
+
+#[inline(always)]
+unsafe fn extract<const N: i32>(input: __m128i, out_ptr: *const u32, i: usize) {
+    let high = _mm_bsrli_si128(input, N);
+    let shuf_high = _mm_cvtepu8_epi32(high);
+    let added = _mm_add_epi32(shuf_high, _mm_set1_epi32(i as i32));
+    _mm_storeu_si128(out_ptr.add(N as usize) as *mut __m128i, added);
+}
+
+#[inline(always)]
+unsafe fn calc_splits_dst(src: &[u8], dst: &mut Vec<u32>) {
+    let len = src.len();
+    debug_assert!(len < (u32::MAX as usize));
+
+    let estimated_req = len / 4;
+    if dst.capacity() < estimated_req {
+        dst.reserve(estimated_req - dst.capacity());
+    }
+
+    {
+        let in_ptr = src.as_ptr();
+
+        let iter_len = round_up::<32>(len);
+        for i in (0..iter_len).step_by(32) {
+            let vec = _mm_loadu_si128(in_ptr.add(i) as *const __m128i);
+            let vec2 = _mm_loadu_si128(in_ptr.add(i + 16) as *const __m128i);
+
+            let zero_eq = _mm_cmpeq_epi8(vec, _mm_setzero_si128());
+            let zero_eq2 = _mm_cmpeq_epi8(vec2, _mm_setzero_si128());
+            let zero_idx = nonz_index(zero_eq);
+            let zero_idx2 = nonz_index(zero_eq2);
+
+            let num_ones = (_mm_movemask_epi8(zero_eq) as u32).count_ones() as usize;
+            let num_ones2 = (_mm_movemask_epi8(zero_eq2) as u32).count_ones() as usize;
+
+            if num_ones > 0 {
+                let num_nulls = min(num_ones, len - i);
+                let rounded = round_up::<4>(num_nulls);
+
+                let out_ptr = dst.as_mut_ptr().add(dst.len());
+
+                extract::<0>(zero_idx, out_ptr, i);
+                if rounded >= 4 {
+                    extract::<4>(zero_idx, out_ptr, i);
+                }
+                if rounded >= 8 {
+                    extract::<8>(zero_idx, out_ptr, i);
+                }
+                if rounded >= 12 {
+                    extract::<12>(zero_idx, out_ptr, i);
+                }
+
+                dst.set_len(dst.len() + num_nulls);
+            }
+
+            if num_ones2 > 0 {
+                let num_nulls = min(num_ones2, len - (i + 16));
+                let rounded = round_up::<4>(num_nulls);
+
+                let out_ptr = dst.as_mut_ptr().add(dst.len());
+
+                extract::<0>(zero_idx2, out_ptr, i + 16);
+                if rounded >= 4 {
+                    extract::<4>(zero_idx2, out_ptr, i + 16);
+                }
+                if rounded >= 8 {
+                    extract::<8>(zero_idx2, out_ptr, i + 16);
+                }
+                if rounded >= 12 {
+                    extract::<12>(zero_idx2, out_ptr, i + 16);
+                }
+
+                dst.set_len(dst.len() + num_nulls);
+            }
+        }
+    }
+    if let Some(c) = src.last() {
+        if *c != 0 {
+            dst.push((len - 1) as u32);
+        }
+    }
+}
+fn calc_splits(src: &[u8]) -> Vec<std::ops::Range<usize>> {
+    let mut dst = Vec::new();
+    unsafe { calc_splits_dst(src, &mut dst) };
+
+    dst.windows(2)
+        .map(|o| std::ops::Range {
+            start: o[0] as usize,
+            end: (o[1] - 1) as usize,
+        })
+        .collect()
 }
 
 impl codec::Decoder for TWSCodec {
@@ -57,7 +193,12 @@ impl codec::Decoder for TWSCodec {
         //println!("Decoding: {:?}", src);
         src.advance(4); //drop packet size bytes
         let mut data = src.split_to(length).freeze();
-
+        trace!("Recieved data: {:?}", data);
+        /* Ok(Some(TWSFrame::Incomming {
+            data,
+            splits: vec![],
+        })) */
+        //Ok(Some(data))
         let splits = data
             .iter()
             .enumerate()
@@ -102,7 +243,14 @@ impl codec::Encoder<DecodedMessage> for TWSCodec {
             dst.put(&b"\0"[..]);
         }
         dst.put(&item.last().unwrap()[..]);
-        println!("Writing: {:?}", dst);
+        trace!("Writing: {:?}", dst);
+
+        /* let data = match &item {
+            TWSFrame::Incomming { data, splits } => data,
+            TWSFrame::Outgoing(data) => data,
+        };
+        println!("Writing: {:?}", data);
+        dst.extend_from_slice(&data[..]);*/
         Ok(())
     }
 }
@@ -114,7 +262,58 @@ mod tests {
     use tokio_util::codec::Decoder;
 
     use super::TWSCodec;
+
+    const STR: &str = include!("sample.txt");
+    const DATA: &[u8] = STR.as_bytes();
     #[test]
+    fn sse_wip() {
+        let res = super::calc_splits(DATA);
+        let mut a;
+        let mut b;
+        let my_iter: &mut dyn Iterator<Item = usize> = if DATA[DATA.len() - 1] == 0 {
+            a = std::iter::empty();
+            &mut a
+        } else {
+            b = std::iter::once(DATA.len());
+            &mut b
+        };
+
+        let splits = DATA
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| match *c {
+                0 => Some(i),
+                _ => None,
+            })
+            .chain(my_iter)
+            .collect::<Vec<_>>()
+            .windows(2)
+            .map(|o| std::ops::Range {
+                start: o[0],
+                end: o[1] - 1,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(res, splits);
+    }
+
+    #[test]
+    fn memchr_test() {
+        let simple = DATA
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| match *c {
+                0 => Some(i),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        let res = memchr::memchr_iter(0, DATA).collect::<Vec<_>>();
+
+        assert_eq!(res, simple);
+    }
+
+    /*     #[test]
     fn empty_buffer_decodes_none() {
         let mut c = TWSCodec::new();
 
@@ -152,10 +351,7 @@ mod tests {
         const DATA: &[u8] = b"\0\0\0\0";
         buf.put_i32(DATA.len() as i32);
         buf.put(&DATA[..]);
-        assert_eq!(
-            c.decode(&mut buf).unwrap(),
-            Some(vec!["".into(), "".into(), "".into(), "".into(),])
-        );
+        assert_eq!(c.decode(&mut buf), Ok(Some(Bytes::from(&DATA[..])));
     }
     #[test]
     fn zero_decodes_as_string() {
@@ -186,7 +382,7 @@ mod tests {
             c.decode(&mut buf).unwrap(),
             Some(vec!["151".into(), "20210309 22:54:30 CET".into()])
         );
-    }
+    } */
 
     #[test]
     fn empty_bytes_behaves_as_expected() {
